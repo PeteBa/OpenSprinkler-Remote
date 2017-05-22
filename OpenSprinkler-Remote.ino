@@ -1,24 +1,21 @@
 #include <ESP8266WiFi.h>
 #include <ESP8266WebServer.h>
+#include <ArduinoOTA.h>
+#include <Time.h>
 #include "OSUtils.h"
-#include "OSSecrets.h"
-
-#define WATER_LEVEL_PIN	4
-
-#define PUSHOVER_URL	"api.pushover.net"
-#define PUSHOVER_PORT	80
-#define PUSHOVER_TITLE	"Station Name"
 
 //*******************************************************************************/
-//* Global variables ************************************************************/
+//* Global variables
 //*******************************************************************************/
 
 ESP8266WebServer * myServer = NULL;
+OSNTPServer * myNTPServer = NULL;
 OSValve * myValve = NULL;
 OSTimer * myTimer = NULL;
+OSConfig * myConfig = NULL;
 
 //*******************************************************************************/
-//* Prototypes ******************************************************************/
+//* Prototypes
 //*******************************************************************************/
 
 void handleRoot();
@@ -26,15 +23,23 @@ void handleSetValve();
 void handleGetOptions();
 void handleNotFound();
 
+void handleNTPUpdate();
+
+void handleOTAStart();
+void handleOTAEnd();
+void handleOTAProgress(unsigned int progress, unsigned int total);
+void handleOTAError(ota_error_t error);
+
 void sendPushNotification(const char * message);
 
 //*******************************************************************************/
-//* Setup ***********************************************************************/
+//* Setup
 //*******************************************************************************/
 
 void setup(void)
 {
 	Serial.begin(115200);
+	WiFi.printDiag(Serial);
 
 	DEBUG_TRACE(__PRETTY_FUNCTION__);
 
@@ -49,19 +54,25 @@ void setup(void)
 	myTimer = new OSTimer();
 	myTimer->clear();
 
-	DEBUG_INFO("Connecting to SSID = %s\n", MY_SSID);
+	DEBUG_INFO("Opening configuration portal for %d seconds\n", CONFIG_PORTAL_TIMEOUT);
 
-	WiFi.mode(WIFI_STA);
-	WiFi.begin(MY_SSID, MY_PSK);
+	myConfig = new OSConfig(CONFIG_FILE);
+	myConfig->load();
+	myConfig->showPortal(CONFIG_PORTAL_TIMEOUT);
+	myConfig->save();
+
+	DEBUG_INFO("Closed configuration portal\n");
+
 	if (WiFi.waitForConnectResult() != WL_CONNECTED) {
-		DEBUG_ERROR("Failed to connect to %s before timeout\n", MY_SSID);
-		delay(3000);
+		DEBUG_INFO("Failed to connect before timeout\n");
+		DEBUG_INFO("Resetting device\n");
 		ESP.reset();
 		delay(5000);
 	}
 
 	IPAddress myIP = WiFi.localIP();
 	DEBUG_INFO("Connected with SSID = %s, IP = %d.%d.%d.%d\n", WiFi.SSID().c_str(), myIP[0], myIP[1], myIP[2], myIP[3]);
+	sendPushNotification("OpenSprinkler Remote has restarted/n");
 
 	myServer = new ESP8266WebServer(80);
 	myServer->on("/", handleRoot);
@@ -71,22 +82,33 @@ void setup(void)
 	myServer->onNotFound(handleNotFound);
 	myServer->begin();
 
-	pinMode(WATER_LEVEL_PIN, INPUT_PULLUP);
+	myNTPServer = new OSNTPServer();
+	myNTPServer->onUpdate(handleNTPUpdate);
+	myNTPServer->startSync();
+
+	ArduinoOTA.onStart(handleOTAStart);
+	ArduinoOTA.onEnd(handleOTAEnd);
+	ArduinoOTA.onProgress(handleOTAProgress);
+	ArduinoOTA.onError(handleOTAError);
+	ArduinoOTA.begin();
+
+	pinMode(PIN_WATER_LEVEL, INPUT_PULLUP);
 
 	DEBUG_INFO("Server started\n");
 	delay(5000);
 }
 
 //*******************************************************************************/
-//* Loop ************************************************************************/
+//* Loop
 //*******************************************************************************/
 
 void loop(void) {
 	static time_t lastCheckedWater = 0;
+	static time_t lastSyncedNTP = 0;
 
 	myServer->handleClient();
 
-	if (myTimer->isSet() && myTimer->hasTriggered()) {
+	if (myTimer->isSet() && myTimer->isTriggered()) {
 		DEBUG_INFO("Timer triggered\n");
 		if (myValve->status() != VALVE_CLOSED) {
 			myValve->close();
@@ -96,16 +118,29 @@ void loop(void) {
 	}
 
 	if (now() - lastCheckedWater > 24 * 60 * 60) {
-		if (digitalRead(WATER_LEVEL_PIN) == LOW) {
+		if (digitalRead(PIN_WATER_LEVEL) == LOW) {
 			DEBUG_INFO("Water level low\n");
 			sendPushNotification("Water level low");
 			lastCheckedWater = now();
 		}
 	}
+
+	if (myNTPServer->isSyncing()) {
+		myNTPServer->handleSync();
+		lastSyncedNTP = now();
+	}
+	else {
+		if (now() - lastSyncedNTP > 24 * 60 * 60) {
+			myNTPServer->startSync();
+			lastSyncedNTP = now();
+		}
+	}
+
+	ArduinoOTA.handle();
 }
 
 //*******************************************************************************/
-//* Push Notifications **********************************************************/
+//* Push Notifications
 //*******************************************************************************/
 
 void sendPushNotification(const char * message) {
@@ -113,15 +148,15 @@ void sendPushNotification(const char * message) {
 
 	DEBUG_TRACE(__PRETTY_FUNCTION__);
 
-	if (PUSHOVER_TOKEN != NULL && PUSHOVER_USER != NULL && PUSHOVER_TITLE != NULL ) {
+	if (strlen(myConfig->getPushoverToken()) > 0 && strlen(myConfig->getPushoverUser()) > 0) {
 
 		DEBUG_INFO("Sending PushOver notification = %s\n", message);
 
 		if (myClient.connect(PUSHOVER_URL, PUSHOVER_PORT)) {
 			String data = \
-				"token=" + String(PUSHOVER_TOKEN) + \
-				"&user=" + String(PUSHOVER_USER) + \
-				"&title=" + String(PUSHOVER_TITLE) + \
+				"token=" + String(myConfig->getPushoverToken()) + \
+				"&user=" + String(myConfig->getPushoverUser()) + \
+				"&title=" + String(myConfig->getPushoverTitle()) + \
 				"&message=" + String(message);
 
 			String msg = \
@@ -149,7 +184,64 @@ void sendPushNotification(const char * message) {
 }
 
 //*******************************************************************************/
-//* Server Handlers *************************************************************/
+//* OTA Handlers
+//*******************************************************************************/
+
+void handleOTAStart() {
+	DEBUG_INFO("OTA Start\n");
+}
+
+void handleOTAEnd() {
+	DEBUG_INFO("OTA End\n");
+}
+
+void handleOTAProgress(unsigned int progress, unsigned int total) {
+	DEBUG_INFO("OTA Progress: %u%%\r", (progress / (total / 100)));
+}
+
+void handleOTAError(ota_error_t error) {
+	DEBUG_ERROR("OTA Error[%u]: ", error);
+
+	if (error == OTA_AUTH_ERROR) {
+		DEBUG_OUTPUT("Auth Failed\n");
+	}
+	else if (error == OTA_BEGIN_ERROR) {
+		DEBUG_OUTPUT("Begin Failed\n");
+	}
+	else if (error == OTA_CONNECT_ERROR) {
+		DEBUG_OUTPUT("Connect Failed\n");
+	}
+	else if (error == OTA_RECEIVE_ERROR) {
+		DEBUG_OUTPUT("Receive Failed\n");
+	}
+	else if (error == OTA_END_ERROR) {
+		DEBUG_OUTPUT("End Failed\n");
+	}
+}
+
+//*******************************************************************************/
+//* NTP Handlers
+//*******************************************************************************/
+
+void handleNTPUpdate() {
+	uint32 ntp_clock;
+	time_t local_clock;
+	int diff;
+
+	DEBUG_TRACE(__PRETTY_FUNCTION__);
+
+	local_clock = now();
+	ntp_clock = myNTPServer->getCurrentTimestamp();
+	diff = ntp_clock - local_clock;
+
+	if (diff != 0) {
+		adjustTime(diff);
+		DEBUG_INFO("Clock sync'ed with NTP server (diff = %ds).\n", diff);
+	}
+}
+
+//*******************************************************************************/
+//* Server Handlers
 //*******************************************************************************/
 
 // Command: GET /
@@ -177,7 +269,7 @@ void handleRoot() {
 								"function sf(valve) {" \
 									"_cm.elements[0].value=valve;" \
 									"_cm.elements[1].value=1-valve_status;" \
-									"_cm.elements[2].value=120;" \
+									"_cm.elements[2].value=" + String(TIMER_DEFAULT_DURATION) + ";" \
 									"_cm.submit()" \
 								"}" \
 							"</script>" \
@@ -211,7 +303,7 @@ void handleSetValve() {
 
 	if ((sid != 0) || (state > 1) || (duration > 600)) {
 		DEBUG_ERROR("Received badly formed command: GET %s sid=%d en=%d t=%d",
-					myServer->uri().c_str(), sid, state, duration);
+			myServer->uri().c_str(), sid, state, duration);
 		return;
 	}
 
