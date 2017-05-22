@@ -1,0 +1,11 @@
+# Editor junk
+/.vs
+/__vm
+/Debug
+/Release
+*.sln
+*.vcxproj
+*.vcxproj.filters
+
+# Local passowrd file
+OSSecrets.h
