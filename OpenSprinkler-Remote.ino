@@ -209,9 +209,15 @@ void handleSetValve() {
 
 	DEBUG_INFO("Handling Set Valve request: SID = %d, State = %d, Duration = %d\n", sid, state, duration);
 
-	if ((sid != 0) || (state > 1) || (duration > 600)) {
+	if ((sid != 0) || (state > 1)) {
 		DEBUG_ERROR("Received badly formed command: GET %s sid=%d en=%d t=%d",
 					myServer->uri().c_str(), sid, state, duration);
+		return;
+	}
+
+	if (duration > 600) {
+		DEBUG_ERROR("Received duration is too long (%d seconds)\n", duration);
+		DEBUG_ERROR("Check \"Remote Station Auto-Refresh\" option in enabled in OS Advanced Settings\n");
 		return;
 	}
 
