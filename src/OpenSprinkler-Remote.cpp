@@ -1,19 +1,18 @@
+#include <Arduino.h>
 #include <ESP8266WiFi.h>
 #include <ESP8266WebServer.h>
 #include "OSUtils.h"
-#include "OSSecrets.h"
+#include "OSConfig.h"
 
-#define WATER_LEVEL_PIN	4
-
-#define PUSHOVER_URL	"api.pushover.net"
-#define PUSHOVER_PORT	80
-#define PUSHOVER_TITLE	"Station Name"
+#define MAX_CYCLE_TIME	1000	// Opensprinkler refreshes remote station status every 800 seconds
+								// See Opensprinker github (OpenSprinkler.cpp) for how this is calculated
 
 //*******************************************************************************/
 //* Global variables
 //*******************************************************************************/
 
 ESP8266WebServer * myServer = NULL;
+OSPushover * myNotifier = NULL;
 OSValve * myValve = NULL;
 OSTimer * myTimer = NULL;
 
@@ -25,8 +24,6 @@ void handleRoot();
 void handleSetValve();
 void handleGetOptions();
 void handleNotFound();
-
-void sendPushNotification(const char * message);
 
 //*******************************************************************************/
 //* Setup
@@ -43,14 +40,15 @@ void setup(void)
 	DEBUG_INFO("Free heap size:%d\n", ESP.getFreeHeap());
 	DEBUG_INFO("Free sketch space:%d\n", ESP.getFreeSketchSpace());
 
-	myValve = new OSValve();
-	myValve->setup();
-
+#ifdef PUSHOVER_ENABLED
+	myNotifier = new OSPushover(PUSHOVER_TOKEN, PUSHOVER_USER);
+#endif
+	myValve = new OSValve(VALVE_CONTROL_PIN, VALVE_ENABLE_PIN, VALVE_PULSE_DURATION);
 	myTimer = new OSTimer();
-	myTimer->clear();
 
 	DEBUG_INFO("Connecting to SSID = %s\n", MY_SSID);
 
+	WiFi.hostname(HOSTNAME);
 	WiFi.mode(WIFI_STA);
 	WiFi.begin(MY_SSID, MY_PSK);
 	if (WiFi.waitForConnectResult() != WL_CONNECTED) {
@@ -86,11 +84,12 @@ void loop(void) {
 
 	myServer->handleClient();
 
-	if (myTimer->isSet() && myTimer->hasTriggered()) {
+	if (myTimer->isTriggered()) {
 		DEBUG_INFO("Timer triggered\n");
-		if (myValve->status() != VALVE_CLOSED) {
+		if (myValve->isOpen()) {
 			myValve->close();
-			sendPushNotification("Valve closed by timer");
+			if (myNotifier)
+				myNotifier->send(HOSTNAME, "Valve closed by timer");
 		}
 		myTimer->clear();
 	}
@@ -98,52 +97,9 @@ void loop(void) {
 	if (now() - lastCheckedWater > 24 * 60 * 60) {
 		if (digitalRead(WATER_LEVEL_PIN) == LOW) {
 			DEBUG_INFO("Water level low\n");
-			sendPushNotification("Water level low");
+			if (myNotifier)
+				myNotifier->send(HOSTNAME, "Water level low");
 			lastCheckedWater = now();
-		}
-	}
-}
-
-//*******************************************************************************/
-//* Push Notifications
-//*******************************************************************************/
-
-void sendPushNotification(const char * message) {
-	WiFiClient myClient;
-
-	DEBUG_TRACE(__PRETTY_FUNCTION__);
-
-	if (PUSHOVER_TOKEN != NULL && PUSHOVER_USER != NULL && PUSHOVER_TITLE != NULL ) {
-
-		DEBUG_INFO("Sending PushOver notification = %s\n", message);
-
-		if (myClient.connect(PUSHOVER_URL, PUSHOVER_PORT)) {
-			String data = \
-				"token=" + String(PUSHOVER_TOKEN) + \
-				"&user=" + String(PUSHOVER_USER) + \
-				"&title=" + String(PUSHOVER_TITLE) + \
-				"&message=" + String(message);
-
-			String msg = \
-				"POST /1/messages.json HTTP/1.1\r\n" \
-				"Host: " PUSHOVER_URL "\r\n" \
-				"Connection: close\r\n" \
-				"Content-Type: application/x-www-form-urlencoded;\r\n" \
-				"Content-Length: " + String(data.length()) + "\r\n" \
-				"\r\n" + \
-				data + "\r\n";
-
-			myClient.print(msg);
-			delay(200);
-
-			DEBUG_INFO("Pushover response = ");
-			while (myClient.available()) {
-				char c = myClient.read();
-				DEBUG_OUTPUT("%c", c);
-				if (c == '\n') break;
-			}
-
-			myClient.stop();
 		}
 	}
 }
@@ -156,15 +112,15 @@ void sendPushNotification(const char * message) {
 //
 // Response: Display hhtp page showing valve status.
 void handleRoot() {
-	bool state;
+	bool isOpen;
 	const char * label;
 	const char * colour;
 
 	DEBUG_TRACE(__PRETTY_FUNCTION__);
 
-	state = myValve->status();
-	label = (state == VALVE_CLOSED) ? "Closed" : "Open";
-	colour = (state == VALVE_CLOSED) ? "Red" : "Green";
+	isOpen = myValve->isOpen();
+	label = (isOpen) ? "Open" : "Closed";
+	colour = (isOpen) ? "Green" : "Red";
 
 	String button = "<html>" \
 						"<head>" \
@@ -173,7 +129,7 @@ void handleRoot() {
 						"</head>" \
 						"<body>" \
 							"<script>" \
-								"var valve_status=" + String(state) + ";" \
+								"var valve_status=" + String(isOpen) + ";" \
 								"function sf(valve) {" \
 									"_cm.elements[0].value=valve;" \
 									"_cm.elements[1].value=1-valve_status;" \
@@ -203,9 +159,9 @@ void handleSetValve() {
 
 	DEBUG_TRACE(__PRETTY_FUNCTION__);
 
-	unsigned int sid = myServer->arg("sid").toInt();
-	unsigned int state = myServer->arg("en").toInt();
-	unsigned int duration = myServer->arg("t").toInt();
+	int sid = myServer->arg("sid").toInt();
+	int state = myServer->arg("en").toInt();
+	int duration = myServer->arg("t").toInt();
 
 	DEBUG_INFO("Handling Set Valve request: SID = %d, State = %d, Duration = %d\n", sid, state, duration);
 
@@ -215,23 +171,25 @@ void handleSetValve() {
 		return;
 	}
 
-	if (duration > 600) {
+	if (duration > MAX_CYCLE_TIME) {
 		DEBUG_ERROR("Received duration is too long (%d seconds)\n", duration);
-		DEBUG_ERROR("Check \"Remote Station Auto-Refresh\" option in enabled in OS Advanced Settings\n");
+		DEBUG_ERROR("Check \"Remote Station Auto-Refresh\" option is enabled in OS Advanced Settings\n");
 		return;
 	}
 
 	if (state == 1) {
-		if (myValve->status() != VALVE_OPEN) {
+		if (!myValve->isOpen()) {
 			myValve->open();
-			sendPushNotification("Valve opened");
+			if (myNotifier)
+				myNotifier->send(HOSTNAME, "Valve opened");
 		}
 		myTimer->set(duration);
 	}
 	else {
-		if (myValve->status() != VALVE_CLOSED) {
+		if (myValve->isOpen()) {
 			myValve->close();
-			sendPushNotification("Valve closed");
+			if (myNotifier)
+				myNotifier->send(HOSTNAME, "Valve closed");
 		}
 		if (myTimer->isSet())
 			myTimer->clear();

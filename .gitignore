@@ -1,11 +1,9 @@
 # Editor junk
-/.vs
-/__vm
-/Debug
-/Release
-*.sln
-*.vcxproj
-*.vcxproj.filters
+/.vscode
+/.pio
 
 # Local passowrd file
-OSSecrets.h
+OSConfig.h
+
+# Powerpoint wiring diagram
+wiring.pptx

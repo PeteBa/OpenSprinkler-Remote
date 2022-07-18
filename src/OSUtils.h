@@ -36,12 +36,12 @@ void set_now(time_t time);
 class OSTimer {
 private:
 	time_t _alarm = 0;
-	bool _status = TIMER_CLEAR;
+	bool _isSet = false;
 public:
 	void set(int duration);
 	void clear();
 	bool isSet();
-	bool hasTriggered();
+	bool isTriggered();
 	int remaining();
 };
 
@@ -49,17 +49,28 @@ public:
 //* OSValve
 //*******************************************************************************/
 
-#define VALVE_OPEN	 1
-#define VALVE_CLOSED 0
-
 class OSValve {
 private:
-	bool _status;
+	int _control_pin;
+	int _enable_pin;
+	int _pulse_duration;
+	bool _isOpen;
 public:
-	void setup();
+	OSValve(int control_pin, int enable_pin, int pulse_duration);
 	void open();
 	void close();
-	bool status();
+	bool isOpen();
 };
 
+//*******************************************************************************/
+//* OSPushover
+//*******************************************************************************/
+
+class OSPushover {
+	const char * _token;
+	const char * _user;
+public:
+	OSPushover(const char * token, const char * user);
+	void send(const char * title, const char * message);
+};
 #endif
